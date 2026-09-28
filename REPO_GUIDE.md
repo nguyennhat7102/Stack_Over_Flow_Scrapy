@@ -434,14 +434,14 @@ sequenceDiagram
     T->>N: Item đủ tag
     N->>N: Chuẩn hóa và kiểm tra schema
     N->>D: Item hợp lệ
-    D->>D: Kiểm tra ID, target; giữ chỗ cho ID mới
+    D->>D: Kiểm tra ID và target, giữ chỗ cho ID mới
     D->>W: Item chưa trùng và còn chỗ
     W->>F: Ghi JSON + newline, flush, fsync
     F-->>W: Ghi thành công
     W->>D: commit(question_id)
     D->>D: Cập nhật seen IDs và bộ đếm
     W-->>E: Pipeline hoàn thành
-    E-->>S: item_scraped; cho phép xử lý tiếp
+    E-->>S: item_scraped, cho phép xử lý tiếp
     Note over T,E: Nếu DropItem: item_dropped giải phóng bước chờ
     Note over W,E: Nếu lỗi xử lý: item_error khiến crawler dừng
     Note over S,F: Cursor chỉ tiến sau khi mọi item của trang đã được xử lý
