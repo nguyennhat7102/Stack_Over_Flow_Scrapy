@@ -1,161 +1,61 @@
 # Data Model: Stack Overflow Transaction Data Collector
 
-**Branch**: `001-so-transaction-collector` | **Phase**: 1 | **Date**: 2026-09-26
+Updated 2026-09-28 following user-approved review clarifications.
 
----
+## Raw item and persisted transaction
 
-## Entities
+`StackOverFlowItem` is the data-transfer object from the API. It contains no business logic.
 
-### 1. StackOverFlowItem (Scrapy Item / Data Transfer Object)
-
-The in-flight data object produced by the spider and processed by the pipeline chain.
-
-| Field | Python Type | Source | Required | Notes |
-|---|---|---|---|---|
-| `question_id` | `int` | API `items[].question_id` | Yes | Primary key / dedup key |
-| `tags` | `list[str]` | API `items[].tags` | Yes | Raw tag list from API; may contain duplicates |
-| `title` | `str` | API `items[].title` | Yes | Human-readable context |
-| `creation_date` | `int` | API `items[].creation_date` | Yes | UNIX timestamp from API |
-| `score` | `int` | API `items[].score` | No | Optional context; default 0 |
-| `answer_count` | `int` | API `items[].answer_count` | No | Optional context; default 0 |
-
-**Defined in**: `StackOverFlow/items.py` as a `@dataclass`.
-
----
-
-### 2. Transaction (Output Record)
-
-A valid, normalized, deduplicated record written to the NDJSON output file. This is the final form of a `StackOverFlowItem` after passing all pipelines.
-
-| Field | JSON Type | Derived From | Notes |
+| Field | Raw API type | Persisted JSON type | Rule |
 |---|---|---|---|
-| `question_id` | `number` | Item `question_id` | Integer; unique across output file |
-| `tags` | `array[string]` | Item `tags` after normalization | Lowercased, whitespace-stripped, deduplicated within question; ≥ 2 items |
-| `title` | `string` | Item `title` | Unchanged |
-| `creation_date` | `string` | Item `creation_date` | ISO-8601 UTC format: `"YYYY-MM-DDTHH:MM:SSZ"` |
-| `score` | `number` | Item `score` | Integer |
-| `answer_count` | `number` | Item `answer_count` | Integer |
+| question_id | integer | integer | Required, positive, bool is not an ID; unique across the output |
+| tags | list of strings | list of strings | Required; lowercase and strip, remove empty/duplicate tags, then require ≥2 |
+| title | string | string | Required; preserved |
+| creation_date | positive UNIX integer | string | Required; UTC `YYYY-MM-DDTHH:MM:SSZ` |
+| score | integer | integer | Defaults to 0 if omitted |
+| answer_count | integer | integer | Defaults to 0 if omitted; nonnegative |
 
-**Stored in**: `output/transactions.jsonl` (one JSON object per line).
+Output is UTF-8 NDJSON, one complete record per line. `validation.py` defines the shared persisted-record contract for pipeline normalization, startup integrity checking, and the validation CLI.
 
----
+## Pipeline responsibilities
 
-### 3. DatePartition (Logical Crawl Unit)
-
-A 7-day time window used to segment the API query space.
-
-| Attribute | Type | Notes |
+| Priority | Pipeline | Responsibility |
 |---|---|---|
-| `fromdate` | `int` (UNIX timestamp) | Inclusive start of partition window |
-| `todate` | `int` (UNIX timestamp) | Exclusive end (`fromdate + 7 * 86400`) |
-| `current_page` | `int` | Current page being fetched (1-indexed) |
-| `is_complete` | `bool` | True when `has_more` is False or `items` is empty or `current_page` == 25 |
+| 100 | TagValidationPipeline | Compute a normalized/deduplicated view of tags and reject malformed tags or fewer than two distinct tags |
+| 200 | NormalizationPipeline | Store the normalized tag representation, convert the timestamp, check the complete schema |
+| 300 | DeduplicationPipeline | Rebuild committed IDs from output; reserve incoming IDs; reject duplicates and additions beyond target |
+| 400 | StoragePipeline | Write, flush and fsync; only then acknowledge the ID to DeduplicationPipeline |
 
-**Lives in**: Spider memory only (generated at `start_requests()`); persisted implicitly via JOBDIR request queue.
+Deduplication owns both the committed-ID set and temporary pending reservations. A storage error releases the reservation, stops the crawl, and leaves the page checkpoint unchanged. Routine drops are DEBUG-only and counted separately as `insufficient_tags`, `duplicate_ids`, and `invalid_schema`.
 
----
+## Date partition and cursor
 
-### 4. CrawlCheckpoint (Scrapy JOBDIR State)
+Partitions have an inclusive start and exclusive end in UTC, normally seven days; the final partition may be shorter. API `todate` is inclusive, so the request uses exclusive end minus one second. Requests use `sort=creation`, `order=asc`, and `pagesize=100`.
 
-Scrapy's native job persistence directory. Contains the pending request queue and spider state.
+Cursor is `(partition_index, page)`, page 1–25. After an empty page, `has_more=false`, or page 25, advance to the next partition. At page 25 with `has_more=true`, explicitly log skipped remaining questions. This is an application sampling cap, not a claim of exhaustive collection or an API-wide limit.
 
-| File | Contents |
-|---|---|
-| `<JOBDIR>/requests.queue/` | Serialized pending API page requests |
-| `<JOBDIR>/spider.state` | Spider `state` dict (used for cross-request counters if needed) |
+## Checkpoint and recovery
 
-**Location**: Configurable via `JOBDIR` setting; default `crawl_jobs/stackoverflow`.
+`JOBDIR` retains Scrapy's disk request queue. `JOBDIR/collector.json` is an atomic, credential-free page checkpoint owned by `PageCheckpoint`, containing configuration, current cursor, output identity/size and a backoff deadline. This supersedes the earlier queue-only design because Scrapy's pending queue alone cannot preserve an in-flight page.
 
----
+- Write the current cursor before requesting its page.
+- Yield items sequentially and await Scrapy's completion/drop/error signal for each item.
+- Advance the cursor only after every item on the page is settled. A stop at the target keeps the current page replayable when the target increases.
+- After quota reaches zero in a successful response, retain its valid items and save the next cursor before stopping.
+- At restart, trust the cursor only if its configuration, shape and output identity/size agree. Otherwise replay from the first configured partition and deduplicate.
+- Discard queued requests from earlier process IDs; generate work from the trusted cursor. If Scrapy's queue is unreadable, preserve its files and fall back to an in-memory queue plus the durable cursor.
+- Only malformed final JSON/UTF-8 may be truncated. Existing schema errors, duplicate IDs and non-final corrupt lines are fatal. A valid final record lacking a newline is preserved and terminated before append.
 
-### 5. SeenIDSet (Runtime Deduplication State)
+Use one process per output/JOBDIR pair; manual edits to healthy output during a crawl are unsupported.
 
-In-memory `set[int]` holding all `question_id`s already present in the output file. Built at `open_spider()` by scanning the existing output file.
+## Counters
 
-| Attribute | Type | Notes |
-|---|---|---|
-| `ids` | `set[int]` | In-memory only; rebuilt from output file on every startup |
-| `size` | `int` | Number of distinct IDs loaded; checked against 100k target at startup |
+`total_written` is the number of committed unique IDs across all runs. `written_this_run`, page/fetch counts and categorized drop counts belong to the current run. Fetched records left unprocessed after an exact-target stop are not classified as dropped; the page is replayable.
 
-**Owned by**: `DeduplicationPipeline`.
 
----
+## Numeric analysis artifacts
 
-## Validation Rules
-
-Enforced by pipelines in strict priority order:
-
-| Rule | Pipeline | Condition | Action |
-|---|---|---|---|
-| Minimum tag count | TagValidationPipeline (100) | `len(set(item.tags)) < 2` | `raise DropItem` |
-| Tag deduplication | TagValidationPipeline (100) | Applied before count check | Deduplicate tag list in-place |
-| Tag normalisation | NormalizationPipeline (200) | Always | Lowercase + strip whitespace on each tag |
-| Date conversion | NormalizationPipeline (200) | Always | `creation_date` int → ISO-8601 UTC string |
-| Duplicate question | DeduplicationPipeline (300) | `question_id` in `seen_ids` | `raise DropItem` |
-| Record persistence | StoragePipeline (400) | Item passed all above | Append NDJSON line to output file |
-
----
-
-## State Transitions: Transaction Lifecycle
-
-```
-API Response JSON
-       │
-       ▼
- Spider parses items[] ──► yield StackOverFlowItem
-                                      │
-                           ┌──────────▼──────────┐
-                           │ TagValidationPipeline│
-                           │ (priority 100)       │
-                           │  set(tags) < 2?      │
-                           │  YES → DropItem      │
-                           └──────────┬───────────┘
-                                      │ NO (≥2 distinct tags)
-                           ┌──────────▼──────────┐
-                           │ NormalizationPipeline│
-                           │ (priority 200)       │
-                           │  lowercase tags      │
-                           │  strip whitespace    │
-                           │  date → ISO-8601     │
-                           └──────────┬───────────┘
-                                      │
-                           ┌──────────▼──────────┐
-                           │ DeduplicationPipeline│
-                           │ (priority 300)       │
-                           │  question_id in set? │
-                           │  YES → DropItem      │
-                           └──────────┬───────────┘
-                                      │ NO (unique)
-                           ┌──────────▼──────────┐
-                           │   StoragePipeline    │
-                           │   (priority 400)     │
-                           │   append NDJSON line │
-                           │   add ID to seen set │
-                           └─────────────────────┘
-                                  Transaction
-                               written to disk
-```
-
----
-
-## File Layout (Source Code)
-
-```text
-StackOverFlow/                         # Scrapy project package
-├── __init__.py
-├── items.py                           # StackOverFlowItem dataclass
-├── middlewares.py                     # StackOverFlowDownloaderMiddleware (API key)
-├── pipelines.py                       # TagValidation, Normalization, Dedup, Storage
-├── settings.py                        # JOBDIR, ITEM_PIPELINES, DOWNLOAD_DELAY, env vars
-└── spiders/
-    └── stackoverflow_spider.py        # StackOverFlowSpider (date-partition + pagination)
-
-output/
-└── transactions.jsonl                 # NDJSON output (created at first run)
-
-crawl_jobs/
-└── stackoverflow/                     # JOBDIR checkpoint directory
-
-tools/
-└── validate_output.py                 # Standalone post-run validation script
-```
+- `transactions_numeric.txt`: one transaction per source question; each row consists solely of ascending distinct positive integer tag IDs separated by spaces, with no header, question ID, or context fields.
+- `tag_mapping.json`: a JSON object from normalized tag string to unique positive integer. Initial assignments start at 1 in source encounter order. Existing assignments remain stable and new tags use max(ID)+1.
+- Multiple source questions with identical tag sets produce identical output rows; they are not deduplicated by basket because their multiplicity matters for association-rule support.
+- The canonical transaction schema and crawler pipelines remain unchanged. Numeric export is a derived artifact; decoding requires its dictionary.

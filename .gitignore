@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+*.egg-info/
+dist/
+.eggs/
+
+# Scrapy
+output/*.jsonl
+output/*.json
+crawl_jobs/
+.scrapy/
+httpcache/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+*.tmp
+
+# Logs
+*.log
+
+# Stack Overflow Transaction Collector
+output/*.jsonl
+crawl_jobs/
+
+# Generated numeric transaction datasets
+output/*.txt

@@ -14,13 +14,13 @@ Collect at least 100,000 unique, valid Stack Overflow question-tag transactions 
 
 ## Technical Context
 
-**Language/Version**: Python 3.9+
+**Language/Version**: Python 3.10+
 
-**Primary Dependencies**: Scrapy 2.x, itemadapter
+**Primary Dependencies**: Scrapy 2.19.0, itemadapter 0.13.1
 
 **Storage**: NDJSON flat file (`output/transactions.jsonl`); Scrapy JOBDIR directory for request queue persistence
 
-**Testing**: Manual acceptance testing via 3-stage validation (pilot ≤ 500, small-batch ≤ 5,000, full-scale 100k+); `tools/validate_output.py` for automated post-run checks
+**Testing**: Offline unittest unit/integration regression tests, plus manual acceptance testing via 3-stage validation (pilot ≤ 500, small-batch ≤ 5,000, full-scale 100k+); `tools/validate_output.py` for automated post-run checks
 
 **Target Platform**: Local development machine / Linux server (CLI, no GUI)
 
@@ -28,9 +28,9 @@ Collect at least 100,000 unique, valid Stack Overflow question-tag transactions 
 
 **Performance Goals**: ≥ 100,000 valid unique transactions collected; quota-safe (1 req/s default, ~10k requests/day with authenticated key)
 
-**Constraints**: Stack Exchange API authenticated quota 10,000 req/day; API hard pagination cap 25 pages per query; no browser automation; no HTML scraping; no Zyte/Playwright/Selenium
+**Constraints**: Stack Exchange API authenticated quota 10,000 req/day; Application sampling cap 25 pages per partition; no browser automation; no HTML scraping; no Zyte/Playwright/Selenium
 
-**Scale/Scope**: ~100,000–200,000 questions processed; ~400 MB NDJSON output at scale; ≤ 5 MB RAM for seen-ID set
+**Scale/Scope**: ~100,000–200,000 questions processed; ~400 MB NDJSON output at scale; seen-ID memory proportional to distinct record count
 
 ---
 
@@ -42,8 +42,8 @@ Collect at least 100,000 unique, valid Stack Overflow question-tag transactions 
 |---|---|---|
 | I. Scrapy Separation of Concerns | ✅ Pass | Spider: parse + yield only. Pipelines: validate, normalize, dedup, store. Middleware: API key injection. Items: data contract only. |
 | II. Transaction Model | ✅ Pass | `question_id` = unique key. `tags` = items. Valid iff ≥ 2 distinct tags. |
-| III. Pause & Resume Safety | ✅ Pass | JOBDIR checkpoints request queue. DeduplicationPipeline rebuilds seen-set from output file on startup. |
-| IV. API Key Security | ✅ Pass | Key read from `os.environ["STACKOVERFLOW_API_KEY"]`. Fail-fast on missing key. Never logged or stored. |
+| III. Pause & Resume Safety | ✅ Pass | JOBDIR holds the request queue and an atomic safe-page cursor. DeduplicationPipeline rebuilds seen-set from output file on startup. |
+| IV. API Key Security | ✅ Pass | Key read from environment; missing-key guard and supplied-key preflight. Transport-only injection with log redaction. |
 | V. No Browser Automation / HTML Scraping | ✅ Pass | All requests target `api.stackexchange.com`. No Zyte, Playwright, Selenium, BeautifulSoup. |
 | VI. Incremental Scale | ✅ Pass | Pilot → Small-batch → Full-scale gates enforced in quickstart.md. |
 | VII. Observable Acceptance Criteria | ✅ Pass | Per-page log lines, final summary, quota-exhaustion log, validation utility with explicit counts. |
@@ -96,3 +96,16 @@ tools/                                 # CREATE: standalone utilities
 ## Complexity Tracking
 
 No constitution violations. No complexity justification required.
+
+## Remediation design (2026-09-28)
+
+Use Scrapy 2.19 async start and crawler-bound pipeline hooks. Process one page and acknowledge each item through Scrapy signals before advancing the cursor. A checkpoint service stores an atomic, key-free page cursor in JOBDIR/collector.json in addition to Scrapy's queue. Old queued requests are discarded by a run identifier; the durable cursor is authoritative for safe replay. Output remains the authoritative dedup store; checkpoint output identity/size is validated, with rollback to the first partition on mismatch. Persist/flush/fsync records before committing IDs or advancing the page. This intentionally extends D-005's queue-only design to cover in-flight pages and hard interruption.
+
+Retry/auth/backoff remain in downloader middleware; checkpoint persistence remains outside the spider. Tests use unittest and a synthetic download handler, never production output or API credentials. Full-scale collection is not part of remediation acceptance.
+
+Implementation adds `validation.py` (shared contract), `checkpoint.py` (durable cursor), `scheduler.py` (corrupt-queue fallback), and `commands/crawl.py` (shell exit status). Python requirement is 3.10+ per the pinned Scrapy distribution; Python 3.14.7 is the verified local environment. Earlier phase descriptions using `start_requests`, queue-only recovery or a 25-page API-wide limit are superseded by this remediation design.
+
+
+## Numeric export design (2026-09-28)
+
+Add `tools/export_numeric.py` as an offline, standard-library CLI. Stream validated source records to a temporary transaction file, retain only the ID set and tag dictionary in memory, preserve repeated baskets, and reuse a tag-to-ID JSON dictionary. Use shared `validation.py` for source schema. Stage both files and replace the dictionary before the transaction file to preserve decoding compatibility on partial publication failure. Default destination: `<source-stem>.numeric.txt` (or `.jsonl` when explicitly selected) alongside the source; default mapping: `tag_mapping.json` in the destination directory. Keep all four crawler pipelines unchanged. Tests in `tests/test_export_numeric.py` cover decoding, stable IDs, both formats, corruption and path safety.

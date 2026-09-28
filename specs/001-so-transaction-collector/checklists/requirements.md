@@ -31,12 +31,23 @@
 
 ## Notes
 
-All 16 checklist items passed after the `/speckit-clarify` session (2026-09-26). Five clarification questions were asked and integrated:
+All 16 checklist items passed after the `/speckit-clarify` gap-resolution session (2026-09-26). Eight additional gaps identified by `checklists/crawler.md` were resolved and integrated:
 
+**Session 1 (5 questions):**
 1. Rate-limit / transient error retry behaviour → FR-013
 2. Corrupted output file recovery → FR-014
 3. Target-already-met restart behaviour → FR-015
 4. API quota exhaustion handling → FR-016
 5. Empty-page / partition advancement behaviour → FR-017 + Date Partition entity added
 
-Key structural refinement from Q5: the collection is date-partitioned. Empty pages signal end-of-partition, not end-of-data. This was propagated to User Story 1, Edge Cases, Key Entities, Functional Requirements, and Assumptions. All items remain checked after re-validation against the updated spec.
+**Session 2 — Gap Resolution (8 gaps from crawler.md):**
+6. Output format: NDJSON crawl-time + optional final JSON array step → FR-004 updated
+7. Tag processing order: normalize → deduplicate → ≥2 filter → FR-011 updated; Duplicate-tags edge case resolved
+8. First-seen snapshot semantics (no update on re-encounter) → FR-006 updated
+9. Final partition may be shorter than 7 days → FR-017 updated; Assumption updated
+10. Missing/corrupt JOBDIR: fall back to output file, re-fetch from safe boundary → FR-018 added
+11. Mid-file NDJSON corruption: fail fast; trailing corrupt line: auto-remove → FR-014 updated
+12. Target stopping rule: stop immediately after 100,000th persisted, not at partition end → FR-010 + FR-020 updated/added
+13. UTF-8 encoding + write-crash safety → FR-019 added
+
+All 16 items remain checked after re-validation against the updated spec (FR-001 through FR-020).

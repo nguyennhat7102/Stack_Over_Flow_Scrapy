@@ -1,131 +1,70 @@
 # CLI Contract: Stack Overflow Transaction Data Collector
 
-**Branch**: `001-so-transaction-collector` | **Phase**: 1 | **Date**: 2026-09-26
+Updated 2026-09-28. Run from the directory containing `scrapy.cfg`.
 
-This document defines the command-line interface contract for the two runnable entry points: the Scrapy crawler and the validation utility.
-
----
-
-## 1. Crawler Entry Point
-
-### Command
+## Crawler
 
 ```bash
-scrapy crawl stackoverflow
+python3 -m scrapy crawl stackoverflow
 ```
 
-Must be run from the project root (directory containing `scrapy.cfg`).
+Set `STACKOVERFLOW_API_KEY` in the same terminal. Missing/empty keys fail at startup without API requests. A supplied key is checked with `/info?site=stackoverflow` before collecting `/questions`. This preflight consumes an API request. Invalid keys halt before collection pages; network failures may take longer than five seconds because retry/backoff still applies. API keys are added only at the HTTPS transport boundary, removed before retry/queueing, and redacted from logs.
 
-### Required Environment Variables
-
-| Variable | Description | Example |
+| Setting | Default | Meaning |
 |---|---|---|
-| `STACKOVERFLOW_API_KEY` | Registered Stack Exchange API application key | `aBcDeFgHiJkLmNoPqRsT` |
+| JOBDIR | crawl_jobs/stackoverflow | Scrapy queue and collector.json safe-page cursor |
+| OUTPUT_FILE | output/transactions.jsonl | UTF-8 NDJSON source of truth |
+| PARTITION_START_DATE | 2008-08-01 | Inclusive UTC date |
+| PARTITION_END_DATE | Today UTC | Exclusive UTC date; start must precede end |
+| TARGET_RECORDS | 100000 | Positive cumulative limit; never append beyond it |
+| DOWNLOAD_DELAY | 1 | Fixed delay in seconds; one concurrent request |
+| RETRY_TIMES | 5 | Maximum retries after the initial attempt (six attempts total) |
+| RETRY_BACKOFF_BASE | 1 | Retry waits: base × 2^(retry number − 1) |
 
-**Fail-fast**: If `STACKOVERFLOW_API_KEY` is absent or empty, the crawler MUST exit within 5 seconds with a non-zero exit code and the message:
+Each seven-day partition is capped at 25 pages by application policy. A `PAGE CAP` warning announces remaining questions skipped before advancing. API backoff and numeric Retry-After can lengthen the retry delay. Persistent API errors halt; the current page stays replayable.
 
-```
-[ERROR] STACKOVERFLOW_API_KEY environment variable is not set. Obtain a key at https://stackapps.com/ and set it before running.
-```
-
-No API requests are made before this check.
-
-### Key Settings (configurable in `settings.py` or via `-s` CLI flag)
-
-| Setting | Default | Description |
-|---|---|---|
-| `JOBDIR` | `crawl_jobs/stackoverflow` | Scrapy JOBDIR for checkpoint persistence |
-| `OUTPUT_FILE` | `output/transactions.jsonl` | NDJSON output path |
-| `PARTITION_START_DATE` | `2008-08-01` | Earliest question date (SO launch) |
-| `PARTITION_END_DATE` | Today (UTC) | Latest question date |
-| `TARGET_RECORDS` | `100000` | Stop when distinct question_ids reaches this count |
-| `CONCURRENT_REQUESTS_PER_DOMAIN` | `1` | Max concurrent requests to Stack Exchange API |
-| `DOWNLOAD_DELAY` | `1` | Seconds between requests (API rate compliance) |
-| `RETRY_TIMES` | `5` | Max retry attempts per request |
-
-### Override Examples
-
-```bash
-# Override output file and start date
-scrapy crawl stackoverflow -s OUTPUT_FILE=output/custom.jsonl -s PARTITION_START_DATE=2020-01-01
-
-# Resume from existing JOBDIR
-scrapy crawl stackoverflow  # JOBDIR is the same; Scrapy auto-resumes
-```
-
-### Exit Codes
-
-| Code | Meaning |
+| Exit code | Meaning |
 |---|---|
-| 0 | Clean exit: target reached, all partitions exhausted, or target already met at startup |
-| 1 | Fatal error: missing credentials, unrecoverable API error (5 consecutive failures), or corrupted output |
+| 0 | Target reached/already met, date range exhausted, or graceful user shutdown |
+| 1 | Startup/configuration/schema/storage/API failure or exhausted retries |
+| 2 | Quota exhausted; retained output and checkpoint allow a later resume |
 
-### Progress Logging (stdout / Scrapy log)
+An exit code of 0 does not itself prove the target was reached: always validate the output. Do not run concurrent processes on the same output/JOBDIR pair.
 
-Per-page log line format (INFO level):
-```
-[stackoverflow] page=<N> partition=<YYYY-MM-DD>/<YYYY-MM-DD> fetched=<N> written=<N> dropped=<N> total_written=<N>
-```
+## Logs
 
-Final summary (INFO level, emitted at spider close):
-```
-[stackoverflow] FINAL SUMMARY | partitions_processed=<N> | pages_consumed=<N> | total_fetched=<N> | total_written=<N> | total_dropped=<N> | quota_remaining=<N>
+```text
+page=5 partition=2023-01-01/2023-01-08 fetched=100 written_this_run=500 dropped=0 total_written=500
+FINAL SUMMARY | reason=target_reached | partitions_processed=0 | pages_consumed=5 | total_fetched=500 | total_written=500 | written_this_run=500 | total_dropped=0 | dropped_by_reason={...} | quota_remaining=...
 ```
 
-Quota-exhausted exit (WARNING level):
-```
-[stackoverflow] QUOTA EXHAUSTED | quota_remaining=0 | reset_time=<ISO-8601> | total_written=<N> | checkpoint_saved=True
-```
+`total_written` includes previous runs. Other counters are per-run. Drops distinguish insufficient normalized tags, duplicates and invalid schema; ordinary individual drops are DEBUG-only. Partial-page target stops leave unprocessed items outside the drop count. `reset_time` is logged only as supplied by the API (may be unavailable); do not invent a reset timestamp.
 
-Target-already-met exit (INFO level):
-```
-[stackoverflow] TARGET ALREADY MET | distinct_ids=<N> >= target=100000 | no API calls made
-```
-
----
-
-## 2. Validation Utility Entry Point
-
-### Command
+## Validator
 
 ```bash
-python tools/validate_output.py [--file PATH]
+python3 tools/validate_output.py --file output/pilot.jsonl --target 500
 ```
 
-### Arguments
+`--file` defaults to `output/transactions.jsonl`; `--target` defaults to 100000 and must be positive. Check complete schema, normalized distinct tags, JSON/UTF-8 validity, duplicate IDs, and minimum valid distinct count. Report all counts. Exit 0 only when every check passes and target is met, otherwise 1 (invalid CLI arguments: argparse exit 2).
 
-| Argument | Default | Description |
-|---|---|---|
-| `--file` | `output/transactions.jsonl` | Path to NDJSON output file to validate |
+## Staged runner
 
-### Output (stdout)
-
-```
-=== Validation Report: output/transactions.jsonl ===
-Total lines          : 112,453
-Distinct question_ids: 112,453
-Duplicate IDs        : 0
-Records with < 2 tags: 0
-Target (100,000) met : YES
-
-✅ Dataset is VALID — 112,453 unique transactions, all with ≥ 2 tags.
+```bash
+bash tools/run_stages.sh [--start-stage 1|2|3] [--output-dir PATH]
 ```
 
-If issues are found:
-```
-=== Validation Report: output/transactions.jsonl ===
-Total lines          : 50,200
-Distinct question_ids: 50,198
-Duplicate IDs        : 2
-Records with < 2 tags: 0
-Target (100,000) met : NO
+The runner uses `python3` (`PYTHON` may override it), validates earlier-stage files when resuming a later stage, and requires manual confirmation before scaling. It asks the operator to attest that pause/resume was observed before starting 100,000. It does not claim to automate the manual interruption test. Any crawl/validation failure stops progression.
 
-❌ Dataset has issues — see above. Re-run the crawler to complete collection.
+
+## Numeric exporter
+
+```bash
+python3 tools/export_numeric.py --input PATH [--output PATH] [--mapping PATH] [--format txt|jsonl]
 ```
 
-### Exit Codes
+`--input` is required and must be canonical crawler NDJSON. Default format: `txt`; default output: `<input-stem>.numeric.txt` beside the source. With JSONL format the default extension is `.jsonl`. Default mapping: `tag_mapping.json` beside the destination.
 
-| Code | Meaning |
-|---|---|
-| 0 | No issues found; target met |
-| 1 | Issues found (duplicates, under-tagged records) or target not yet met |
+TXT lines contain sorted integer IDs only, e.g. `1 2 5`; JSONL lines are arrays, e.g. `[1, 2, 5]`. The dictionary is tag-to-ID JSON. ID assignments are stable when reusing it. Existing output is rebuilt from the complete source, not appended. Input is unchanged.
+
+Exit 0 means export completed and counts/paths were printed; exit 1 means source/mapping/I/O validation failed; argparse errors exit 2. All validation and source-stability checks precede publication. Mapping replacement happens first; if transaction-file replacement then fails, the dictionary may include extra unused tags but prior codes remain valid. Retrying is safe. Do not run concurrent exporters against the same output/dictionary.
